@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>XIAO Tremor/GSR Live Viewer</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 900px;
+      margin: 2rem auto;
+      padding: 1rem;
+    }
+    button {
+      padding: 0.6rem 1.2rem;
+      font-size: 1rem;
+      cursor: pointer;
+      margin-right: 0.5rem;
+    }
+    #status { margin-top: 1rem; font-weight: 500; }
+    #latest {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #f9f9f9;
+      white-space: pre-wrap;
+    }
+    #log {
+      margin-top: 1rem;
+      height: 250px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 0.5rem;
+      overflow-y: auto;
+      font-family: monospace;
+      background: #fafafa;
+      font-size: 0.85rem;
+    }
+    #severityBox {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      background: #f5f5f5;
+      white-space: pre-wrap;
+    }
+    #trendBox {
+      margin-top: 0.75rem;
+      padding: 0.75rem;
+      border-radius: 6px;
+      border: 1px solid #ddd;
+      background: #fbfbfb;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>XIAO Tremor/GSR Live Viewer</h1>
+  <p>Click “Connect” to pair with your XIAO and stream data over Bluetooth.</p>
+  <button id="connectBtn">Connect to XIAO</button>
+  <button id="disconnectBtn" disabled>Disconnect</button>
+  <!-- Alarm controls -->
+  <div style="margin-top: 1rem;">
+    <button id="startAlarmBtn">Test Alarm</button>
+    <button id="stopAlarmBtn">Stop Alarm</button>
+  </div>
+
+  <div id="status">Status: Not connected</div>
+
+  <h2>Latest sample</h2>
+  <div id="latest">—</div>
+
+  <h2>Severity (per 30 s window)</h2>
+  <div id="severityBox">
+    No window processed yet.
+  </div>
+
+  <h3>Long-term trend</h3>
+  <div id="trendBox">
+    Waiting for history…
+  </div>
+
+  <h2>Raw log</h2>
+  <div id="log"></div>
+
+  <script>
+    // -----------------------------------------------------------------------
+    // BLE configuration
+    // -----------------------------------------------------------------------
+    const SERVICE_UUID = '12345678-1234-1234-1234-1234567890ab';
+    const CHAR_UUID    = '12345678-1234-5678-1234-56789abcdef1';
+    const DEVICE_NAME  = 'SweatIMU';
+
+    let bleDevice = null;
+    let bleCharacteristic = null;
+
+    const statusEl   = document.getElementById('status');
+    const logEl      = document.getElementById('log');
+    const latestEl   = document.getElementById('latest');
+    const severityEl = document.getElementById('severityBox');
+    const trendEl    = document.getElementById('trendBox');
+    const connectBtn    = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+
+    // -----------------------------------------------------------------------
+    // Threshold-like constants (JS mirror of thresholds.py – tune as needed)
+    // -----------------------------------------------------------------------
+    const TH = {
+      // EDA
+      EDA_MIN_WIN_SEC: 20.0,
+      EDA_MIN_SCR_SEP_SEC: 1.0,
+      EDA_DERIV_SIGMA: 3.0,
+      EDA_MIN_REL_AMP: 0.10,
+      EDA_MIN_SCR_PER_MIN: 4.0,
+
+      // Tremor
+      TREMOR_RATIO_THRESH: 5.0,   // simplified; ratio based on RMS
+      ACCEL_RMS_THRESH: 0.2,      // g
+      GYRO_RMS_THRESH_DPS: 10.0,  // deg/s
+
+      // Long-term
+      HISTORY_MAX_WINDOWS: 60,
+      EWMA_ALPHA: 0.2,
+      CUSUM_K: 0.5,
+      CUSUM_H: 5.0,
+      MIN_WINDOWS_FOR_LONGTERM: 4,
+      MIN_WINDOWS_FOR_SEVERITY: 4,
+
+      // Fusion
+      WITHDRAWAL_LONGTERM_REQUIRE: false
+    };
+
+    // -----------------------------------------------------------------------
+    // Small numeric helpers
+    // -----------------------------------------------------------------------
+    function log(msg) {
+      const line = document.createElement('div');
+      line.textContent = msg;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    function setStatus(msg) {
+      statusEl.textContent = 'Status: ' + msg;
+    }
+
+    function median(arr) {
+      if (!arr.length) return 0;
+      const tmp = arr.slice().sort((a, b) => a - b);
+      const mid = Math.floor(tmp.length / 2);
+      return tmp.length % 2 ? tmp[mid] : 0.5 * (tmp[mid - 1] + tmp[mid]);
+    }
+
+    function mad(arr, med) {
+      if (!arr.length) return 0;
+      const dev = arr.map(v => Math.abs(v - med));
+      return median(dev);
+    }
+
+    function estimateFs(t_ms) {
+      if (t_ms.length < 2) return NaN;
+      const diffs = [];
+      for (let i = 1; i < t_ms.length; i++) {
+        diffs.push(t_ms[i] - t_ms[i - 1]);
+      }
+      const dt_ms = median(diffs);
+      if (!isFinite(dt_ms) || dt_ms <= 0) return NaN;
+      return 1000.0 / dt_ms;
+    }
+
+    function linearSlope(x, y) {
+      const n = x.length;
+      if (n < 2) return 0;
+      let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+      for (let i = 0; i < n; i++) {
+        sumX += x[i];
+        sumY += y[i];
+        sumXY += x[i] * y[i];
+        sumXX += x[i] * x[i];
+      }
+      const denom = n * sumXX - sumX * sumX;
+      if (!isFinite(denom) || Math.abs(denom) < 1e-12) return 0;
+      return (n * sumXY - sumX * sumY) / denom;
+    }
+
+    function clip01(x) {
+      return Math.max(0, Math.min(1, x));
+    }
+
+    // -----------------------------------------------------------------------
+    // Window + long-term state
+    // -----------------------------------------------------------------------
+    let currentWindow = [];     // list of {t_ms,R_ohm,ax,ay,az,gx,gy,gz}
+    let histWindows   = [];     // long-term history of window summaries
+    let longTermState = {
+      ewma_eda_median_uS: 0,
+      ewma_tremor_ratio: 0,
+      cusum_pos: 0,
+      cusum_neg: 0,
+      n: 0
+    };
+
+    // -----------------------------------------------------------------------
+    // BLE connect / disconnect
+    // -----------------------------------------------------------------------
+    async function connectToXiao() {
+      try {
+        setStatus('Requesting device…');
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ name: DEVICE_NAME }],
+          optionalServices: [SERVICE_UUID]
+        });
+        bleDevice = device;
+        bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+        setStatus('Connecting…');
+        const server = await bleDevice.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        const characteristic = await service.getCharacteristic(CHAR_UUID);
+        bleCharacteristic = characteristic;
+
+        await bleCharacteristic.startNotifications();
+        bleCharacteristic.addEventListener('characteristicvaluechanged', handleNotification);
+
+        setStatus('Connected and streaming');
+        log('Connected to ' + bleDevice.name);
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+      } catch (e) {
+        setStatus('Error: ' + e.message);
+        log(e);
+      }
+    }
+
+    function disconnectFromXiao() {
+      try {
+        if (bleCharacteristic) {
+          bleCharacteristic.removeEventListener('characteristicvaluechanged', handleNotification);
+        }
+        if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) {
+          bleDevice.gatt.disconnect();
+        }
+      } catch (e) {
+        console.error(e);
+      } finally {
+        onDisconnected();
+      }
+    }
+
+    function onDisconnected() {
+      setStatus('Disconnected');
+      log('Disconnected');
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+      bleDevice = null;
+      bleCharacteristic = null;
+    }
+
+    // -----------------------------------------------------------------------
+    // Signal processing (JS port-ish of your Python pipeline)
+    // -----------------------------------------------------------------------
+    function analyzeWindow(rows) {
+      const n = rows.length;
+      if (n < 3) return null;
+
+      const t_ms = rows.map(r => r.t_ms);
+      const t_s  = t_ms.map(v => v * 1e-3);
+      const R    = rows.map(r => r.R_ohm);
+      const ax   = rows.map(r => r.ax);
+      const ay   = rows.map(r => r.ay);
+      const az   = rows.map(r => r.az);
+      const gx   = rows.map(r => r.gx);
+      const gy   = rows.map(r => r.gy);
+      const gz   = rows.map(r => r.gz);
+
+      const fs = estimateFs(t_ms);
+      const dur = t_s[t_s.length - 1] - t_s[0];
+      if (!isFinite(dur) || dur < TH.EDA_MIN_WIN_SEC) {
+        return null; // too short, skip
+      }
+
+      // ---- EDA features ----
+      const G_uS = R.map(r => 1e6 / Math.max(1.0, r));
+      const sclMedian = median(G_uS);
+      const x = t_s.map(v => v - t_s[0]);
+      const slope = linearSlope(x, G_uS); // µS/s
+
+      let scrPerMin = 0;
+      let relPromMedian = 0;
+
+      if (G_uS.length >= 5) {
+        // derivative-based SCR detection (simple fallback)
+        const dy = [];
+        for (let i = 1; i < G_uS.length; i++) {
+          const dt = Math.max(1e-3, t_s[i] - t_s[i - 1]);
+          dy.push((G_uS[i] - G_uS[i - 1]) / dt);
+        }
+        const dyMed = median(dy);
+        let varSum = 0;
+        for (const v of dy) varSum += (v - dyMed) ** 2;
+        const dyStd = Math.sqrt(varSum / Math.max(1, dy.length - 1));
+        const z = dy.map(v => (v - dyMed) / (dyStd || 1e-6));
+
+        const minSep = Math.max(1, Math.round(TH.EDA_MIN_SCR_SEP_SEC * (fs || 1)));
+        let lastIdx = -minSep;
+        const peakIdx = [];
+
+        for (let i = 1; i < z.length; i++) {
+          if (z[i - 1] < TH.EDA_DERIV_SIGMA && z[i] >= TH.EDA_DERIV_SIGMA && (i - lastIdx) >= minSep) {
+            lastIdx = i;
+            peakIdx.push(i);
+          }
+        }
+
+        scrPerMin = (peakIdx.length / Math.max(dur, 1e-6)) * 60.0;
+
+        const baseline = sclMedian;
+        const prominences = peakIdx.map(idx => Math.max(0, G_uS[idx] - baseline));
+        const relProm = prominences.map(p => p / (baseline || 1e-9));
+        relPromMedian = relProm.length ? median(relProm) : 0;
+      }
+
+      const heightened = (scrPerMin >= TH.EDA_MIN_SCR_PER_MIN) || (relPromMedian >= 0.1);
+
+      const eda = {
+        scl_median_uS: sclMedian,
+        scl_slope_uS_per_s: slope,
+        scr_per_min: scrPerMin,
+        rel_peak_prom_median: relPromMedian,
+        heightened_arousal: heightened
+      };
+
+      // ---- Tremor features (RMS-based approximation) ----
+      const G0 = 9.80665;
+      const RAD2DEG = 180.0 / Math.PI;
+
+      const accMag = [];
+      const gyroMag = [];
+      for (let i = 0; i < n; i++) {
+        const a = Math.sqrt(ax[i] ** 2 + ay[i] ** 2 + az[i] ** 2) / G0;
+        const g = Math.sqrt(gx[i] ** 2 + gy[i] ** 2 + gz[i] ** 2) * RAD2DEG;
+        accMag.push(a);
+        gyroMag.push(g);
+      }
+      const accelRms = Math.sqrt(accMag.reduce((s, v) => s + v * v, 0) / n);
+      const gyroRms  = Math.sqrt(gyroMag.reduce((s, v) => s + v * v, 0) / n);
+
+      // Simplified "tremor ratio": gyro RMS relative to a nominal 1 deg/s baseline
+      const tremorRatio = gyroRms / 1.0;
+
+      let tremorFlag = tremorRatio >= TH.TREMOR_RATIO_THRESH;
+      if (TH.ACCEL_RMS_THRESH != null) {
+        tremorFlag = tremorFlag || (accelRms >= TH.ACCEL_RMS_THRESH);
+      }
+      if (TH.GYRO_RMS_THRESH_DPS != null) {
+        tremorFlag = tremorFlag || (gyroRms >= TH.GYRO_RMS_THRESH_DPS);
+      }
+
+      const tremor = {
+        accel_rms_g: accelRms,
+        gyro_rms_dps: gyroRms,
+        tremor_peak_hz: NaN,  // not computed in JS version
+        tremor_ratio: tremorRatio,
+        tremor_flag: tremorFlag
+      };
+
+      const withdrawal_window_flag = (eda.heightened_arousal || tremorFlag);
+
+      return {
+        fs_hz: fs,
+        n_samples: n,
+        eda,
+        tremor,
+        withdrawal_window_flag
+      };
+    }
+
+    function updateLongTerm(win) {
+      // Maintain rolling history
+      histWindows.push({
+        eda_median_uS: win.eda.scl_median_uS,
+        tremor_ratio: win.tremor.tremor_ratio,
+        window_flag: win.withdrawal_window_flag
+      });
+      if (histWindows.length > TH.HISTORY_MAX_WINDOWS) {
+        histWindows.shift();
+      }
+
+      const valsMed = histWindows.map(h => h.eda_median_uS);
+      const valsTr  = histWindows.map(h => h.tremor_ratio);
+
+      const medMed = median(valsMed);
+      const madMed = mad(valsMed, medMed) + 1e-6;
+      const zMed   = (win.eda.scl_median_uS - medMed) / (1.4826 * madMed);
+
+      const medTr  = median(valsTr);
+      const madTr  = mad(valsTr, medTr) + 1e-6;
+      const zTr    = (win.tremor.tremor_ratio - medTr) / (1.4826 * madTr);
+
+      // EWMA
+      const a = TH.EWMA_ALPHA;
+      if (longTermState.n === 0) {
+        longTermState.ewma_eda_median_uS = win.eda.scl_median_uS;
+        longTermState.ewma_tremor_ratio  = win.tremor.tremor_ratio;
+      } else {
+        longTermState.ewma_eda_median_uS =
+          a * win.eda.scl_median_uS + (1 - a) * longTermState.ewma_eda_median_uS;
+        longTermState.ewma_tremor_ratio =
+          a * win.tremor.tremor_ratio + (1 - a) * longTermState.ewma_tremor_ratio;
+      }
+
+      // CUSUM on standardized metrics
+      const k = TH.CUSUM_K;
+      const h = TH.CUSUM_H;
+
+      const s_pos_eda = Math.max(0, longTermState.cusum_pos + (zMed - k));
+      const s_neg_eda = Math.min(0, longTermState.cusum_neg + (zMed + k));
+
+      const s_pos_tr  = Math.max(0, s_pos_eda + (zTr - k));
+      const s_neg_tr  = Math.min(0, s_neg_eda + (zTr + k));
+
+      longTermState.cusum_pos = s_pos_tr;
+      longTermState.cusum_neg = s_neg_tr;
+      longTermState.n += 1;
+
+      const longterm_alert = (longTermState.cusum_pos >= h);
+
+      return {
+        z_eda_median: zMed,
+        z_tremor_ratio: zTr,
+        ewma_eda_median_uS: longTermState.ewma_eda_median_uS,
+        ewma_tremor_ratio: longTermState.ewma_tremor_ratio,
+        cusum_pos: longTermState.cusum_pos,
+        cusum_neg: longTermState.cusum_neg,
+        longterm_alert: longterm_alert,
+        windows_seen: longTermState.n
+      };
+    }
+
+    function computeSeverity(win, lt) {
+      // JS port of severity.compute_severity
+      const reasons = [];
+      const subs = {};
+
+      const n_windows = lt.windows_seen || 0;
+      const warmup_longterm = n_windows < TH.MIN_WINDOWS_FOR_LONGTERM;
+      const warmup_severity = n_windows < TH.MIN_WINDOWS_FOR_SEVERITY;
+
+      // EDA absolute baseline
+      const z_med = lt.z_eda_median || 0;
+      const s_absEDA = clip01(0.5 + 0.125 * z_med);
+      subs.absEDA = s_absEDA;
+      if (z_med >= 2.0) {
+        reasons.push(`Elevated baseline conductance (z≈${z_med.toFixed(1)}).`);
+      }
+
+      // Phasic EDA
+      const scr_rate = win.eda.scr_per_min;
+      const prom_med = win.eda.rel_peak_prom_median;
+      const s_scr  = clip01(scr_rate / Math.max(TH.EDA_MIN_SCR_PER_MIN * 2.0, 1e-6));
+      const s_prom = clip01(prom_med / 0.25);
+      const s_phasic = 0.6 * s_scr + 0.4 * s_prom;
+      subs.phasicEDA = s_phasic;
+      if (s_phasic >= 0.6) {
+        reasons.push('Frequent/strong phasic sweating (SCRs).');
+      }
+
+      // Tremor subscores
+      const tr_ratio = win.tremor.tremor_ratio;
+      const s_tremor_ratio = clip01(
+        (tr_ratio - TH.TREMOR_RATIO_THRESH) /
+        Math.max(TH.TREMOR_RATIO_THRESH, 1e-6)
+      );
+      subs.tremorRatio = s_tremor_ratio;
+      if (s_tremor_ratio >= 0.6) {
+        reasons.push(`Pronounced tremor spectral peak (ratio≈${tr_ratio.toFixed(1)}).`);
+      }
+
+      const accel_rms = win.tremor.accel_rms_g;
+      const gyro_rms  = win.tremor.gyro_rms_dps;
+      const s_acc  = TH.ACCEL_RMS_THRESH
+        ? clip01(0.5 * accel_rms / TH.ACCEL_RMS_THRESH)
+        : 0.0;
+      const s_gyro = TH.GYRO_RMS_THRESH_DPS
+        ? clip01(0.5 * gyro_rms / TH.GYRO_RMS_THRESH_DPS)
+        : 0.0;
+
+      const s_tremor = Math.max(s_tremor_ratio, 0.5 * s_acc + 0.5 * s_gyro);
+      subs.tremor = s_tremor;
+      if (s_acc >= 0.6 || s_gyro >= 0.6) {
+        reasons.push('High movement amplitude.');
+      }
+
+      // Long-term alert
+      const raw_lt_alert = !!lt.longterm_alert;
+      const lt_alert = raw_lt_alert && !warmup_longterm;
+      subs.longTerm = lt_alert ? 1.0 : 0.0;
+
+      if (lt_alert) {
+        reasons.push('Sustained upward trend over time (CUSUM).');
+      } else if (raw_lt_alert && warmup_longterm) {
+        reasons.push('Possible upward trend, but long-term baseline not yet stable.');
+      }
+
+      // Weighting fusion
+      const w_absEDA = 0.25;
+      const w_phasic = 0.15;
+      const w_tremor = 0.25;
+      const w_long   = 0.35;
+
+      let score01 =
+        w_absEDA * subs.absEDA +
+        w_phasic * subs.phasicEDA +
+        w_tremor * subs.tremor +
+        w_long   * subs.longTerm;
+
+      score01 = clip01(score01);
+      const score_nl = Math.pow(score01, 0.8);
+
+      // First compute the usual 1–10 "raw" severity
+      let level10 = Math.max(1, Math.min(10, Math.ceil(score_nl * 10)));
+
+      if (warmup_severity && level10 > 5) {
+        level10 = 5;
+        reasons.push(
+          `Severity capped during baseline warmup (${n_windows}/${TH.MIN_WINDOWS_FOR_SEVERITY} windows).`
+        );
+      }
+
+      if (win.withdrawal_window_flag && level10 < 3) {
+        level10 = warmup_severity ? 3 : 4;
+      }
+
+      if (lt_alert && level10 < 6 && !warmup_severity) {
+        level10 = 6;
+      }
+
+      // Deduplicate reasons
+      const uniqReasons = [];
+      const seen = new Set();
+      for (const r of reasons) {
+        if (!seen.has(r)) {
+          seen.add(r);
+          uniqReasons.push(r);
+        }
+        if (uniqReasons.length >= 4) break;
+      }
+
+      // ----------------------------------------------
+      // Map 1–10 raw severity into 1–3 display buckets
+      // ----------------------------------------------
+      let displayLevel;
+      if (level10 <= 3) {
+        displayLevel = 1;         // low
+      } else if (level10 <= 6) {
+        displayLevel = 2;         // moderate
+      } else {
+        displayLevel = 3;         // high
+      }
+
+      return {
+        level: displayLevel,      // what you show in the UI (1–3)
+        rawLevel10: level10,      // underlying 1–10 value if you ever want it
+        reasons: uniqReasons,
+        subs
+      };
+    }
+
+    function updateSeverityUI(win, lt, sev) {
+      if (!win || !lt || !sev) return;
+
+      const lvl = sev.level;  // 1–3
+      let band = 'Low';
+      let bg   = '#e8f5e9';
+      if (lvl === 2) { band = 'Moderate'; bg = '#fffbe6'; }
+      if (lvl === 3) { band = 'High';     bg = '#ffebee'; }
+
+      severityEl.style.background = bg;
+      severityEl.textContent =
+        `Severity: ${lvl}/3 (${band})\n` +
+        (sev.reasons.length
+          ? 'Reasons:\n  • ' + sev.reasons.join('\n  • ')
+          : 'No specific triggers identified in this window.');
+
+      trendEl.textContent =
+        `Windows seen: ${lt.windows_seen}\n` +
+        `Current median EDA: ${win.eda.scl_median_uS.toFixed(2)} µS\n` +
+        `EWMA EDA baseline: ${lt.ewma_eda_median_uS.toFixed(2)} µS\n` +
+        `Tremor ratio (RMS-based): ${win.tremor.tremor_ratio.toFixed(2)}\n` +
+        `CUSUM+: ${lt.cusum_pos.toFixed(2)}  |  Long-term alert: ${lt.longterm_alert ? 'YES' : 'no'}`;
+    }
+
+    function finalizeWindow() {
+      if (!currentWindow.length) return;
+      const win = analyzeWindow(currentWindow);
+      currentWindow = [];
+
+      if (!win) {
+        log('Window too short or invalid – skipping processing.');
+        return;
+      }
+      const lt  = updateLongTerm(win);
+      const sev = computeSeverity(win, lt);
+
+      // optional "suspect" flag like run_pipeline.py
+      const suspect = TH.WITHDRAWAL_LONGTERM_REQUIRE
+        ? (win.withdrawal_window_flag && lt.longterm_alert)
+        : (win.withdrawal_window_flag || lt.longterm_alert);
+
+      log(
+        `Processed window: fs≈${win.fs_hz.toFixed(1)} Hz, ` +
+        `EDA med=${win.eda.scl_median_uS.toFixed(2)} µS, ` +
+        `SCR/min=${win.eda.scr_per_min.toFixed(2)}, ` +
+        `tremor RMS gyro=${win.tremor.gyro_rms_dps.toFixed(2)} deg/s, ` +
+        `severity_display=${sev.level}/3, raw=${sev.rawLevel10}/10, ` +
+        `suspect=${suspect ? 'YES' : 'no'}`
+      );
+
+      updateSeverityUI(win, lt, sev);
+    }
+
+    // -----------------------------------------------------------------------
+    // BLE notification handler
+    // -----------------------------------------------------------------------
+    function handleNotification(event) {
+      const text = new TextDecoder().decode(event.target.value);
+
+      // In case multiple lines arrive in one packet, split them
+      const lines = text.split(/\r?\n/);
+      for (const lineRaw of lines) {
+        const line = lineRaw.trim();
+        if (!line) continue;
+
+        log(line);
+
+        if (line === 'S') {
+          latestEl.textContent = 'End of window (S)';
+          finalizeWindow();
+          continue;
+        }
+
+        const p = line.split(',').map(x => x.trim());
+        if (p.length === 8) {
+          latestEl.textContent =
+            `t=${p[0]} ms\n` +
+            `R=${p[1]} ohm\n` +
+            `ax=${p[2]}, ay=${p[3]}, az=${p[4]}\n` +
+            `gx=${p[5]}, gy=${p[6]}, gz=${p[7]}`;
+
+          const row = {
+            t_ms: Number(p[0]),
+            R_ohm: Number(p[1]),
+            ax: Number(p[2]),
+            ay: Number(p[3]),
+            az: Number(p[4]),
+            gx: Number(p[5]),
+            gy: Number(p[6]),
+            gz: Number(p[7])
+          };
+          currentWindow.push(row);
+        } else {
+          latestEl.textContent = line;
+        }
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Button wiring
+    // -----------------------------------------------------------------------
+    connectBtn.onclick = () => {
+      if (!navigator.bluetooth) {
+        alert('Web Bluetooth not supported. Use recent Chrome / Edge.');
+        return;
+      }
+      connectToXiao();
+    };
+
+    disconnectBtn.onclick = () => {
+      disconnectFromXiao();
+    };
+
+    // ===========================
+    // Alarm logic (web version)
+    // ===========================
+    let alarmActive = false;
+    let audioCtx = null;
+
+    // 3-tone repeating alarm (same pattern as Python script)
+    const alarmFreqs = [600, 900, 700];   // Hz
+    const alarmDurMs = 600;               // 0.6 seconds per tone
+
+    function playSingleTone(freq, durationMs) {
+      return new Promise(resolve => {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+
+        osc.frequency.value = freq;
+        osc.type = "sine";
+
+        const now = audioCtx.currentTime;
+        const durationSec = durationMs / 1000;
+
+        // Soft attack/decay to avoid harsh clicks
+        gain.gain.setValueAtTime(0.0, now);
+        gain.gain.linearRampToValueAtTime(0.6, now + 0.05);
+        gain.gain.linearRampToValueAtTime(0.3, now + durationSec);
+
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        osc.start(now);
+        osc.stop(now + durationSec);
+
+        osc.onended = () => resolve();
+      });
+    }
+
+    async function alarmLoop() {
+      while (alarmActive) {
+        for (const f of alarmFreqs) {
+          if (!alarmActive) break;
+          await playSingleTone(f, alarmDurMs);
+        }
+      }
+    }
+
+    function startAlarm() {
+      if (alarmActive) return;
+      alarmActive = true;
+
+      // Start repeating alarm pattern
+      alarmLoop();
+
+      // Same popup message as Python version
+      alert("Alert: Alcohol Withdrawal Alert. Check on Patient");
+    }
+
+    function stopAlarm() {
+      alarmActive = false;
+    }
+
+    // Wire alarm buttons
+    document.getElementById("startAlarmBtn").addEventListener("click", startAlarm);
+    document.getElementById("stopAlarmBtn").addEventListener("click", stopAlarm);
+
+  </script>
+</body>
+</html>
