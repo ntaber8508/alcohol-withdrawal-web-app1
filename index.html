@@ -354,7 +354,7 @@
         tremorFlag = tremorFlag || (accelRms >= TH.ACCEL_RMS_THRESH);
       }
       if (TH.GYRO_RMS_THRESH_DPS != null) {
-        tremorFlag = tremorFlag || (gyroRms >= TH.GYRO_RMS_THRESH_DPS);
+        tremorFlag = tremorFlag || (gyroRms >= TH.GRO_RMS_THRESH_DPS);
       }
 
       const tremor = {
@@ -567,21 +567,65 @@
       };
     }
 
+    // -----------------------------------------------------------------------
+    // >>> Modified: severity display & milder wording
+    // -----------------------------------------------------------------------
     function updateSeverityUI(win, lt, sev) {
       if (!win || !lt || !sev) return;
 
-      const lvl = sev.level;  // 1–3
+      const lvl = sev.level;  // 1–3 bucket
       let band = 'Low';
       let bg   = '#e8f5e9';
       if (lvl === 2) { band = 'Moderate'; bg = '#fffbe6'; }
       if (lvl === 3) { band = 'High';     bg = '#ffebee'; }
 
+      // Show as 1–3/10 for presentation
+      const displayStr = `${lvl}/10`;
+
+      // Soften the language of reasons
+      let reasonText = '';
+      if (sev.reasons.length) {
+        const softened = sev.reasons.map((r) => {
+          let s = r;
+          s = s.replace(
+            'Elevated baseline conductance',
+            'Slightly higher baseline sweat response'
+          );
+          s = s.replace(
+            'Frequent/strong phasic sweating (SCRs).',
+            'More frequent short sweat responses.'
+          );
+          s = s.replace(
+            'Frequent/strong phasic sweating (SCRs)',
+            'More frequent short sweat responses'
+          );
+          s = s.replace(
+            'Pronounced tremor spectral peak',
+            'Noticeable rhythmic movement pattern'
+          );
+          s = s.replace(
+            'High movement amplitude.',
+            'Increased movement compared with recent baseline.'
+          );
+          s = s.replace(
+            'Sustained upward trend over time (CUSUM).',
+            'Pattern has been trending upward across recent windows.'
+          );
+          s = s.replace(
+            'Possible upward trend, but long-term baseline not yet stable.',
+            'Possible upward trend, but the system is still learning this baseline.'
+          );
+          return s;
+        });
+        reasonText = 'Notes:\n  • ' + softened.join('\n  • ');
+      } else {
+        reasonText = 'No notable changes compared with recent baseline.';
+      }
+
       severityEl.style.background = bg;
       severityEl.textContent =
-        `Severity: ${lvl}/3 (${band})\n` +
-        (sev.reasons.length
-          ? 'Reasons:\n  • ' + sev.reasons.join('\n  • ')
-          : 'No specific triggers identified in this window.');
+        `Severity: ${displayStr} (${band})\n` +
+        reasonText;
 
       trendEl.textContent =
         `Windows seen: ${lt.windows_seen}\n` +
